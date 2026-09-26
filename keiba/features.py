@@ -52,9 +52,21 @@ def parse_date(s):
     return date(y, m, d)
 
 
+# True にするとキャッシュにある成績だけを使い、サイトへは取りに行かない（バックテスト用）
+OFFLINE = False
+
+
 @lru_cache(maxsize=None)
 def history(horse_id, max_age_days=3):
-    return tuple(netkeiba.horse_history(horse_id, max_age_days=max_age_days)) if horse_id else ()
+    if not horse_id:
+        return ()
+    if OFFLINE:
+        try:
+            netkeiba.fetch(f"{netkeiba.DB}/horse/result/{horse_id}/", cached_only=True)
+        except netkeiba.NotCached:
+            return ()
+        max_age_days = None
+    return tuple(netkeiba.horse_history(horse_id, max_age_days=max_age_days))
 
 
 # ---- 基準タイム ----

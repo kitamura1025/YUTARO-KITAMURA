@@ -61,27 +61,35 @@ def fit(races, features=None, l2=0.02, iters=400, lr=0.3, top=3):
     mean = {f: sum(x) / len(x) if x else 0.0 for f, x in vals.items()}
     sd = {f: (math.sqrt(sum((a - mean[f]) ** 2 for a in x) / len(x)) or 1.0) if x else 1.0 for f, x in vals.items()}
     params = {"mean": mean, "sd": sd, "coef": {f: 0.0 for f in features}}
+    # 速度のため、特徴量はリストにして持つ
     data = []
     for r in races:
-        zs = {k: standardize(v, params) for k, v in r["feats"].items()}
-        data.append((zs, [h for h in r["order"][:top] if h in zs]))
-    coef = {f: (1.0 if f == "market" else 0.0) for f in features}
+        zs = {}
+        for k, v in r["feats"].items():
+            z = standardize(v, params)
+            zs[k] = [z[f] for f in features]
+        order = [h for h in r["order"][:top] if h in zs]
+        if order:
+            data.append((list(zs.values()), [list(zs).index(h) for h in order]))
+    nf = len(features)
+    w = [1.0 if f == "market" else 0.0 for f in features]
     for _ in range(iters):
-        grad = {f: -l2 * coef[f] * len(data) for f in features}
-        for zs, order in data:
-            remaining = set(zs)
+        grad = [-l2 * w[j] * len(data) for j in range(nf)]
+        for xs, order in data:
+            util = [sum(wj * xj for wj, xj in zip(w, x)) for x in xs]
+            alive = list(range(len(xs)))
             for h in order:
-                u = {k: sum(coef[f] * zs[k][f] for f in features) for k in remaining}
-                m = max(u.values())
-                ex = {k: math.exp(u[k] - m) for k in remaining}
+                m = max(util[i] for i in alive)
+                ex = {i: math.exp(util[i] - m) for i in alive}
                 s = sum(ex.values())
-                for f in features:
-                    grad[f] += zs[h][f] - sum(ex[k] * zs[k][f] for k in remaining) / s
-                remaining.discard(h)
-        for f in features:
-            coef[f] += lr * grad[f] / len(data)
+                for j in range(nf):
+                    grad[j] += xs[h][j] - sum(ex[i] * xs[i][j] for i in alive) / s
+                alive.remove(h)
+        for j, f in enumerate(features):
+            w[j] += lr * grad[j] / len(data)
             if f in POSITIVE_ONLY:
-                coef[f] = max(coef[f], 0.0)
+                w[j] = max(w[j], 0.0)
+    coef = dict(zip(features, w))
     params["coef"] = coef
     return params
 

@@ -1,7 +1,8 @@
 """過去の重賞でモデルを学習・検証し、北村式フォーメーションの成績を出す。
 
 使い方:
-  python3 backtest.py --collect 200     # 検証レースを集める（初回は時間がかかる。キャッシュされる）
+  python3 backtest.py --collect 200     # 重賞を辿って検証レースを集める（初回は時間がかかる。キャッシュされる）
+  python3 backtest.py --all             # キャッシュ済みの全クラスのレースも検証に使う（出走馬の成績・血統を取得）
   python3 backtest.py                   # 学習（古い7割）→ 検証（新しい3割）→ 全レースで再学習して params.json 保存
 
 検証レースは「今回の出走馬 → その過去の重賞 → その出走馬の過去の重賞…」と辿って集める。
@@ -9,7 +10,9 @@
 """
 import argparse
 import json
+import math
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,32 +65,49 @@ def build_race(rid):
     feats = {k: features.horse_features(e, info, before, pace_idx, (1 / e.odds) / total, bias)[0]
              for k, e in entries.items()}
     order = [m["umaban"] for m in sorted(members, key=lambda m: m["rank"] or 99) if m["rank"]]
-    return {"id": rid, "date": info["date"], "name": info["name"], "feats": feats, "order": order}
+    return {"id": rid, "date": info["date"], "name": info["name"], "cls": info["cls"], "feats": feats,
+            "order": order, "trifecta": info.get("trifecta")}
 
 
-def prefetch(ids):
-    """出走馬と、その近走の勝ち馬（相手関係の計算用）の成績を先に全部取っておく。
+def cached_races():
+    """キャッシュ済みのレース結果のうち、検証に使えるもの（JRA芝ダ・8頭以上・オッズあり）"""
+    ids = []
+    for path in netkeiba.CACHE.glob("db_netkeiba_com_race_[0-9]*"):
+        rid = path.name.rsplit("_", 2)[-2]
+        info, members = netkeiba.race_members(rid, cached_only=True)
+        if info["surface"] in ("芝", "ダ") and sum(1 for m in members if m["odds"]) >= 8:
+            ids.append(rid)
+    return sorted(ids)
+
+
+def prefetch(ids, workers=2):
+    """出走馬の成績と血統を先に全部取っておく（2本並行）。
     基準タイムはキャッシュ済みの全成績から作るので、特徴量を作る前に済ませる。"""
     horses = set()
     for rid in ids:
         _, members = netkeiba.race_members(rid)
         horses |= {m["horse_id"] for m in members if m["horse_id"]}
-    others = set()
-    for i, hid in enumerate(sorted(horses)):
-        others |= {r.other_id for r in features.history(hid, max_age_days=None)[:8] if r.other_id}
-        if i % 100 == 0:
-            print(f"  成績取得 出走馬 {i}/{len(horses)}", flush=True)
-    others -= horses
-    for i, hid in enumerate(sorted(others)):
-        features.history(hid, max_age_days=None)
-        if i % 100 == 0:
-            print(f"  成績取得 相手馬 {i}/{len(others)}", flush=True)
+    todo = sorted(horses)
+    print(f"  成績・血統の取得 {len(todo)}頭", flush=True)
+
+    def one(hid):
+        try:
+            netkeiba.horse_history(hid, max_age_days=None)
+            netkeiba.pedigree(hid)
+        except Exception as ex:  # noqa: BLE001
+            print("skip", hid, ex, flush=True)
+
+    with ThreadPoolExecutor(workers) as ex:
+        for i, _ in enumerate(ex.map(one, todo)):
+            if i % 500 == 0:
+                print(f"  成績・血統 {i}/{len(todo)}", flush=True)
 
 
 def load_dataset(ids, rebuild=False):
     cached = pickle.loads(DATASET_FILE.read_bytes()) if DATASET_FILE.exists() and not rebuild else {}
     if any(rid not in cached for rid in ids):
-        prefetch(ids)
+        prefetch([rid for rid in ids if rid not in cached])
+    features.OFFLINE = True  # ここから先はキャッシュだけで計算する
     features.standards.cache_clear()
     features.history.cache_clear()
     stats.table.cache_clear()
@@ -109,7 +129,6 @@ def load_dataset(ids, rebuild=False):
 
 def simulate(races, params, label):
     """毎レース北村式48点を買った場合の成績を、軸・対抗・相手の選び方ごとに出す"""
-    import math
     for strategy in betting.STRATEGIES:
         hits = paid = cost = 0
         for r in races:
@@ -119,8 +138,7 @@ def simulate(races, params, label):
             cost += len(tickets) * 100
             if tuple(r["order"][:3]) in tickets:
                 hits += 1
-                tri = netkeiba.result(r["id"])["trifecta"]
-                paid += tri[1] if tri else 0
+                paid += r["trifecta"][1] if r.get("trifecta") else 0
         print(f"  {label:<10} {strategy:<6} 的中 {hits:>2}/{len(races)} ({hits / len(races):.0%})  回収率 {paid / cost:.0%}")
 
 
@@ -130,9 +148,13 @@ def main():
     ap.add_argument("--seed", default="202606040911")
     ap.add_argument("--since", default="2023/01/01")
     ap.add_argument("--rebuild", action="store_true", help="特徴量を作り直す")
+    ap.add_argument("--all", action="store_true", help="キャッシュ済みの全クラスのレースも使う")
     a = ap.parse_args()
 
     ids = collect(a.seed, a.collect, a.since) if a.collect else json.loads(RACES_FILE.read_text())
+    if a.all:
+        ids = sorted(set(ids) | set(cached_races()))
+        RACES_FILE.write_text(json.dumps(ids))
     races = sorted(load_dataset(ids, a.rebuild), key=lambda r: r["date"])
     cut = int(len(races) * 0.7)
     train, test = races[:cut], races[cut:]
@@ -146,6 +168,21 @@ def main():
           "（大きいほど良い）")
     simulate(test, market, "市場オッズのみ")
     simulate(test, tuned, "モデル")
+
+    print("\n■ 要素グループごとの効果（確認用レース。市場オッズだけの値より大きければ効果あり）")
+    groups = {"タイム・相手関係": ["speed_best", "speed_avg", "level"], "適性": ["course_fit", "going_fit", "experience"],
+              "展開": ["front", "pace_fit"], "開催傾向": ["track_fit"],
+              "騎手・調教師": ["jockey", "trainer", "jockey_trainer", "jockey_course"], "血統": ["sire", "damsire"],
+              "ローテ・その他": ["layoff", "weight_diff", "age", "inner"]}
+    print(f"  市場オッズのみ {model.loglik(test, market):.4f}")
+    for g, fs in groups.items():
+        print(f"  市場＋{g:<10} {model.loglik(test, model.fit(train, ['market'] + fs)):.4f}")
+    graded = [r for r in test if r.get("cls") in GRADED]
+    other = [r for r in test if r.get("cls") not in GRADED]
+    for label, rs in (("重賞", graded), ("重賞以外", other)):
+        if len(rs) >= 20:
+            print(f"\n■ 確認用レースの内訳: {label} {len(rs)}R  市場 {model.loglik(rs, market):.4f} / モデル {model.loglik(rs, tuned):.4f}")
+            simulate(rs, tuned, "モデル")
 
     final = model.fit(races)
     print("\n■ 全レースで学習した重み（標準化後。+は勝率を上げる方向）")

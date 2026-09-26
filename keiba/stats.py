@@ -14,6 +14,7 @@ from datetime import timedelta
 from functools import lru_cache
 
 from . import netkeiba
+from . import features
 from .features import history, parse_date, speed_figure
 
 # (引き戻しの強さ K, 最低回数 MIN_N, 集計期間[日])
@@ -132,7 +133,7 @@ def connections(entry, target, before):
     """騎手・調教師・騎手×調教師・騎手×コース・父・母父の Stat をまとめて返す"""
     t = table()
     try:
-        ped = netkeiba.pedigree(entry.horse_id)
+        ped = netkeiba.pedigree(entry.horse_id, cached_only=features.OFFLINE)
     except Exception:  # noqa: BLE001
         ped = {}
     tid = getattr(entry, "trainer_id", "") or ""
@@ -177,7 +178,11 @@ def meet_race_ids(race_id, race_date, surface):
         key = f"{race_id[:8]}{d:02d}"
         # 前の開催日は1〜8日前のどこか（連続開催・中1週など）
         for back in ([0] if d == day else range(1, 9)):
-            day_list = netkeiba.race_list((race_date - timedelta(days=back)).strftime("%Y%m%d"))
+            try:
+                day_list = netkeiba.race_list((race_date - timedelta(days=back)).strftime("%Y%m%d"),
+                                              cached_only=features.OFFLINE)
+            except netkeiba.NotCached:
+                continue
             found = {k: v for k, v in day_list.items() if k.startswith(key)}
             if found:
                 ids += [k for k, (sf, _) in sorted(found.items())
@@ -199,8 +204,8 @@ def meet_bias(race_id, surface, going, race_date=None):
     for rid in ids:
         d, r = int(rid[8:10]), int(rid[10:12])
         try:
-            info, members = netkeiba.race_members(rid)
-            if not members:  # db.netkeiba に載る前（当日・前日）は速報ページから
+            info, members = netkeiba.race_members(rid, cached_only=features.OFFLINE)
+            if not members and not features.OFFLINE:  # db.netkeiba に載る前（当日・前日）は速報ページから
                 info, members = netkeiba.race_members_live(rid)
         except Exception:  # noqa: BLE001
             continue

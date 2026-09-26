@@ -370,9 +370,9 @@ def race_members_live(race_id):
     return info, runners
 
 
-def race_list(yyyymmdd, refresh=False):
+def race_list(yyyymmdd, refresh=False, cached_only=False):
     """その日の全レース {race_id: (芝/ダ/障, 距離)}"""
-    t = fetch(f"{RACE}/top/race_list_sub.html?kaisai_date={yyyymmdd}", refresh=refresh)
+    t = fetch(f"{RACE}/top/race_list_sub.html?kaisai_date={yyyymmdd}", refresh=refresh, cached_only=cached_only)
     out = {}
     for it in re.findall(r'<li class="RaceList_DataItem.*?</li>', t, re.S):
         rid = re.search(r"race_id=(\d{12})", it)
@@ -418,6 +418,13 @@ def race_members(race_id, cached_only=False):
             "trainer_id": (re.search(r"/trainer/(?:result/recent/)?(\w+)", tds[22]) or [None, ""])[1],
         })
     info["field_size"] = len(runners)
+    tri = re.search(r"三連単</th>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>", t, re.S)
+    info["trifecta"] = None
+    if tri:
+        combo = tuple(int(x) for x in re.findall(r"\d+", _text(tri.group(1))))
+        pay = re.search(r"[\d,]+", _text(tri.group(2)))
+        if len(combo) == 3 and pay:
+            info["trifecta"] = (combo, int(pay.group(0).replace(",", "")))
     return info, runners
 
 
