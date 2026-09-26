@@ -1,7 +1,7 @@
 """netkeiba の公開ページからデータを取得・解析する。
 
 取得したHTML/JSONは data/cache/ に保存し、同じURLは再取得しない
-（オッズなど変化するものは refresh=True で取り直す）。
+（オッズなど変化するものは refresh=True、馬の成績のように増えていくものは max_age_days で取り直す）。
 """
 import html
 import json
@@ -16,17 +16,25 @@ UA = "Mozilla/5.0 (keiba-research; personal use)"
 RACE = "https://race.netkeiba.com"
 
 
-def fetch(url, refresh=False, wait=1.0):
+DB = "https://db.netkeiba.com"
+WAIT = 0.7
+
+
+def fetch(url, refresh=False, max_age_days=None, wait=None):
     CACHE.mkdir(parents=True, exist_ok=True)
     key = re.sub(r"[^A-Za-z0-9]+", "_", url.split("://", 1)[1])[:200]
     path = CACHE / key
-    if path.exists() and not refresh:
+    fresh = path.exists() and not refresh and (
+        max_age_days is None or time.time() - path.stat().st_mtime < max_age_days * 86400)
+    if fresh:
         return path.read_text(encoding="utf-8")
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=30) as r:
-        body = r.read().decode("utf-8", errors="ignore")
+        raw = r.read()
+    enc = "euc-jp" if b"EUC-JP" in raw[:2000].upper() else "utf-8"
+    body = raw.decode(enc, errors="ignore")
     path.write_text(body, encoding="utf-8")
-    time.sleep(wait)  # サイトに負荷をかけない
+    time.sleep(WAIT if wait is None else wait)  # サイトに負荷をかけない
     return body
 
 
@@ -63,6 +71,7 @@ class PastRun:
 
 @dataclass
 class Entry:
+    horse_id: str
     waku: int
     umaban: int
     name: str
@@ -139,8 +148,9 @@ def race_card(race_id, refresh=False):
         barei = re.search(r'Barei">(.*?)<', row).group(1)
         jk = re.search(r'class="Jockey">.*?<a[^>]*>(.*?)</a>.*?<span>([\d.]+)</span>', row, re.S)
         past = [p for p in (_parse_past_cell(td) for td in re.findall(r'<td class="Past.*?</td>', row, re.S)) if p]
+        hid = re.search(r'db\.netkeiba\.com/horse/(\w+)', info_td)
         entries.append(Entry(
-            waku=int(_text(tds[0][1])), umaban=int(_text(tds[1][1])), name=name,
+            horse_id=hid.group(1) if hid else "", waku=int(_text(tds[0][1])), umaban=int(_text(tds[1][1])), name=name,
             sex=barei[0], age=int(re.search(r"\d+", barei).group(0)),
             jockey=_text(jk.group(1)) if jk else "", weight=float(jk.group(2)) if jk else 0.0,
             trainer=trainer, style=style.group(1) if style else "", past=past,
@@ -201,3 +211,137 @@ def result(race_id):
         pay = re.search(r"([\d,]+)円", _text(tri.group(2)))
         trifecta = (combo, int(pay.group(1).replace(",", "")) if pay else None)
     return {"order": order, "going": gm.group(1) if gm else "", "trifecta": trifecta}
+
+
+# ---- db.netkeiba.com: 馬の全成績とレースの全出走馬 ----
+
+PLACES = {"札幌": "01", "函館": "02", "福島": "03", "新潟": "04", "東京": "05",
+          "中山": "06", "中京": "07", "京都": "08", "阪神": "09", "小倉": "10"}
+
+
+def race_class(name):
+    """レース名からクラスを判定（G1/G2/G3/L/OP/3勝/2勝/1勝/未勝利/新馬）"""
+    m = re.search(r"\((G|Jpn)(I{1,3})\)", name)
+    if m:
+        return "G" + str(len(m.group(2)))
+    for key, val in (("(L)", "L"), ("(OP)", "OP"), ("3勝", "3勝"), ("1600万", "3勝"), ("2勝", "2勝"),
+                     ("1000万", "2勝"), ("1勝", "1勝"), ("500万", "1勝"), ("未勝利", "未勝利"), ("新馬", "新馬")):
+        if key in name:
+            return val
+    return "OP"  # 表記のない特別戦・海外など
+
+
+def _time_sec(s):
+    m = re.match(r"(\d+):(\d+\.\d)", s)
+    return int(m.group(1)) * 60 + float(m.group(2)) if m else None
+
+
+def _num(s, cast=float):
+    try:
+        return cast(s)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class Run:
+    """馬の1走分の成績（db.netkeiba の成績表から）"""
+    date: str  # YYYY/MM/DD
+    place: str  # 中山 など（海外・地方は名前そのまま）
+    race_id: str
+    name: str
+    cls: str
+    field_size: int | None
+    waku: int | None
+    umaban: int | None
+    odds: float | None
+    popularity: int | None
+    rank: int | None
+    jockey: str
+    weight: float | None
+    surface: str
+    distance: int
+    going: str
+    time: float | None
+    diff: float | None
+    passage: list
+    pace: tuple | None  # (前半3F, 後半3F) レース全体
+    last3f: float | None
+    body_weight: int | None
+    other_id: str  # 勝ち馬（自分が1着なら2着馬）のID
+
+    @property
+    def jra(self):
+        return self.place in PLACES
+
+    @property
+    def early(self):
+        """最初のコーナーの位置取り（0=先頭 〜 1=最後方）"""
+        if not self.passage or not self.field_size or self.field_size < 2:
+            return None
+        return (self.passage[0] - 1) / (self.field_size - 1)
+
+
+def horse_history(horse_id, max_age_days=3):
+    t = fetch(f"{DB}/horse/result/{horse_id}/", max_age_days=max_age_days)
+    m = re.search(r"<table[^>]*db_h_race_results[^>]*>.*?</table>", t, re.S)
+    runs = []
+    if not m:
+        return runs
+    for row in re.findall(r"<tr.*?</tr>", m.group(0), re.S)[1:]:
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+        if len(tds) < 32:
+            continue
+        g = lambda i: _text(tds[i])  # noqa: E731
+        rid = re.search(r"/race/(\w+)/", tds[4])
+        place = re.sub(r"\d", "", g(1))
+        sd = re.match(r"(芝|ダ|障)(\d+)", g(14))
+        pace = re.match(r"([\d.]+)-([\d.]+)", g(26))
+        other = re.search(r"/horse/(\w+)/", tds[31])
+        bw = re.match(r"(\d+)", g(28))
+        runs.append(Run(
+            date=g(0), place=place, race_id=rid.group(1) if rid else "", name=g(4), cls=race_class(g(4)),
+            field_size=_num(g(6), int), waku=_num(g(7), int), umaban=_num(g(8), int), odds=_num(g(9)),
+            popularity=_num(g(10), int), rank=_num(g(11), int), jockey=g(12), weight=_num(g(13)),
+            surface=sd.group(1) if sd else "", distance=int(sd.group(2)) if sd else 0,
+            going=g(16)[:1], time=_time_sec(g(18)), diff=_num(g(19)),
+            passage=[int(x) for x in re.findall(r"\d+", g(25))],
+            pace=(float(pace.group(1)), float(pace.group(2))) if pace else None,
+            last3f=_num(g(27)), body_weight=int(bw.group(1)) if bw else None,
+            other_id=other.group(1) if other else "",
+        ))
+    return runs
+
+
+def race_members(race_id):
+    """確定済みレースの全出走馬。db.netkeiba のレースページから。"""
+    t = fetch(f"{DB}/race/{race_id}/")
+    head = _text((re.search(r'racedata fc">(.*?)</dl>', t, re.S) or re.search(r"racedata.*?</p>", t, re.S)).group(0))
+    sd = re.search(r"(芝|ダ|障)[右左直外内 ]*(\d+)m", head)
+    gm = re.search(r"(?:芝|ダート) : (良|稍重|重|不良)", head)
+    dm = re.search(r"(\d{4})年(\d{2})月(\d{2})日", t)
+    title = _text(re.search(r"<title>(.*?)</title>", t, re.S).group(1)).split("｜")[0]
+    info = {"race_id": race_id, "name": title, "cls": race_class(title),
+            "surface": sd.group(1) if sd else "", "distance": int(sd.group(2)) if sd else 0,
+            "outer": "外" in head[:40], "going": gm.group(1)[:1] if gm else "",
+            "date": f"{dm.group(1)}/{dm.group(2)}/{dm.group(3)}" if dm else "",
+            "place": next((k for k, v in PLACES.items() if race_id[4:6] == v), "")}
+    runners = []
+    m = re.search(r"<table[^>]*race_table_01[^>]*>.*?</table>", t, re.S)
+    for row in re.findall(r"<tr.*?</tr>", m.group(0) if m else "", re.S)[1:]:
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+        if len(tds) < 19:
+            continue
+        g = lambda i: _text(tds[i])  # noqa: E731
+        hid = re.search(r"/horse/(\w+)/", tds[3])
+        sa = re.match(r"(\D)(\d+)", g(4))
+        runners.append({
+            "rank": _num(g(0), int), "waku": _num(g(1), int), "umaban": _num(g(2), int),
+            "horse_id": hid.group(1) if hid else "", "name": g(3),
+            "sex": sa.group(1) if sa else "", "age": int(sa.group(2)) if sa else 0,
+            "weight": _num(g(5)), "jockey": g(6), "time": _time_sec(g(7)),
+            "passage": [int(x) for x in re.findall(r"\d+", g(14))], "last3f": _num(g(15)),
+            "odds": _num(g(16)), "popularity": _num(g(17), int),
+        })
+    info["field_size"] = len(runners)
+    return info, runners

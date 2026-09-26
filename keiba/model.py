@@ -1,108 +1,94 @@
-"""近走成績から能力スコアを作り、単勝オッズ（市場）と混ぜて各馬の勝率を出す。
+"""特徴量から各馬の勝率を出すモデル（条件付きロジット / Plackett-Luce）。
 
-スコアは「秒」単位のイメージ（大きいほど強い）。
-パラメータは backtest.py で過去レースに当てはめて調整し、params.json に保存する。
+勝率 ∝ exp(Σ 重み × 標準化した特徴量)。重みは backtest.py で過去レースの
+1〜3着の並びが最も出やすくなるように学習し、params.json に保存する。
 """
 import json
 import math
 from pathlib import Path
 
+from .features import FEATURES
+
 PARAMS_FILE = Path(__file__).resolve().parent.parent / "params.json"
-
-DEFAULT = {
-    "recency": [1.0, 0.8, 0.65, 0.5, 0.4],  # 前走→5走前の重み
-    "best_weight": 0.5,       # 近5走のベストパフォーマンスをどれだけ足すか
-    "going_weight": 0.15,     # 道悪（重・不良）実績の重み（当日が重・不良の時だけ効く）
-    "training_weight": 0.08,  # 調教評価 A:+ / C,D:-
-    "age_weight": 0.05,       # 3-4歳:+ / 7歳以上:-
-    "inner_weight": 0.03,     # 1-4枠:+（中山外1200などの内枠有利コース）
-    "temperature": 0.35,      # スコア→確率の鋭さ（小さいほど差が開く）
-    "market_blend": 0.5,      # 1.0=市場オッズだけ / 0.0=モデルだけ
-}
-
-# 着差にクラスの格を足して「G1で走っていたら何秒差か」に揃える
-CLASS_GAP = {"G1": 0.0, "G2": 0.15, "G3": 0.3, "OP": 0.5, "L": 0.45, "3勝": 0.8, "2勝": 1.1, "1勝": 1.4}
 
 
 def load_params():
-    p = dict(DEFAULT)
     if PARAMS_FILE.exists():
-        p.update(json.loads(PARAMS_FILE.read_text()))
-    return p
+        p = json.loads(PARAMS_FILE.read_text())
+        if "coef" in p:
+            return p
+    # 未学習時は市場オッズだけ
+    return {"mean": {}, "sd": {}, "coef": {"market": 1.0}}
 
 
-def run_performance(run, target_distance, target_surface="芝"):
-    """1走ぶんの評価値と、その走りの参考度（0〜1）。"""
-    diff = run.diff
-    if diff is None:  # 海外など着差なし → 着順から大まかに推定
-        if run.rank is None:
-            return None, 0.0
-        diff = min(0.1 * (run.rank - 1), 1.5)
-    elif run.rank is None:
-        return None, 0.0
-    diff = max(min(diff, 2.5), -0.4)  # 大敗・大差勝ちは頭打ち
-    perf = -(diff + CLASS_GAP.get(run.grade, 1.6))
-    rel = max(0.2, 1 - abs(run.distance - target_distance) / 800)
-    if run.surface != target_surface:
-        rel *= 0.35
-    return perf, rel
+def save_params(p):
+    PARAMS_FILE.write_text(json.dumps(p, ensure_ascii=False, indent=2))
 
 
-def horse_score(entry, race, params, going=""):
-    w = params["recency"]
-    num = den = 0.0
-    best = None
-    heavy = []
-    for i, run in enumerate(entry.past[:5]):
-        perf, rel = run_performance(run, race["distance"], race["surface"])
-        if perf is None:
-            continue
-        num += w[i] * rel * perf
-        den += w[i] * rel
-        if rel >= 0.7:
-            best = perf if best is None else max(best, perf)
-        if run.going in ("重", "不") and run.surface == race["surface"]:
-            heavy.append(perf)
-    if den == 0:
-        base = -2.0  # データがない馬は低めに
-    else:
-        base = num / den + params["best_weight"] * ((best if best is not None else num / den) - num / den)
-    extra = 0.0
-    if going in ("重", "不") and heavy:
-        extra += params["going_weight"] * (sum(heavy) / len(heavy) - num / den if den else 0) + params["going_weight"] * 0.5
-    if entry.training in ("A",):
-        extra += params["training_weight"]
-    elif entry.training in ("C", "D"):
-        extra -= params["training_weight"]
-    if entry.age <= 4:
-        extra += params["age_weight"]
-    elif entry.age >= 7:
-        extra -= params["age_weight"]
-    if entry.waku <= 4:
-        extra += params["inner_weight"]
-    return base + extra
+def standardize(feats, params):
+    z = {}
+    for k in FEATURES:
+        v = feats.get(k)
+        sd = params["sd"].get(k) or 1.0
+        z[k] = 0.0 if v is None else max(-4.0, min(4.0, (v - params["mean"].get(k, 0.0)) / sd))
+    return z
 
 
-def softmax(scores, temperature):
-    m = max(scores.values())
-    ex = {k: math.exp((v - m) / temperature) for k, v in scores.items()}
+def probs(race_feats, params):
+    """race_feats: {馬番: 特徴量dict} → {馬番: 勝率}"""
+    util = {k: sum(params["coef"].get(f, 0.0) * z for f, z in standardize(v, params).items())
+            for k, v in race_feats.items()}
+    m = max(util.values())
+    ex = {k: math.exp(u - m) for k, u in util.items()}
     s = sum(ex.values())
     return {k: v / s for k, v in ex.items()}
 
 
-def market_probs(entries):
-    raw = {e.umaban: 1 / e.odds for e in entries if e.odds}
-    s = sum(raw.values())
-    return {k: v / s for k, v in raw.items()} if s else {}
+def contributions(feats, params):
+    """各特徴量が勝率を押し上げた/下げた量（説明用）"""
+    return {f: params["coef"].get(f, 0.0) * z for f, z in standardize(feats, params).items()}
 
 
-def win_probs(entries, race, params=None, going=""):
-    """{馬番: 勝率}。モデルと市場を対数空間で混ぜる。"""
-    params = params or load_params()
-    scores = {e.umaban: horse_score(e, race, params, going) for e in entries}
-    pm = softmax(scores, params["temperature"])
-    mk = market_probs(entries)
-    a = params["market_blend"] if mk else 0.0
-    mixed = {k: math.exp((1 - a) * math.log(pm[k]) + a * math.log(mk.get(k, 1e-4))) for k in pm}
-    s = sum(mixed.values())
-    return {k: v / s for k, v in mixed.items()}, scores
+def fit(races, features=None, l2=0.02, iters=400, lr=0.3, top=3):
+    """races: [{'feats': {馬番: dict}, 'order': [1着, 2着, 3着 ...]}]"""
+    features = features or FEATURES
+    vals = {f: [v[f] for r in races for v in r["feats"].values() if v.get(f) is not None] for f in features}
+    mean = {f: sum(x) / len(x) if x else 0.0 for f, x in vals.items()}
+    sd = {f: (math.sqrt(sum((a - mean[f]) ** 2 for a in x) / len(x)) or 1.0) if x else 1.0 for f, x in vals.items()}
+    params = {"mean": mean, "sd": sd, "coef": {f: 0.0 for f in features}}
+    data = []
+    for r in races:
+        zs = {k: standardize(v, params) for k, v in r["feats"].items()}
+        data.append((zs, [h for h in r["order"][:top] if h in zs]))
+    coef = {f: (1.0 if f == "market" else 0.0) for f in features}
+    for _ in range(iters):
+        grad = {f: -l2 * coef[f] * len(data) for f in features}
+        for zs, order in data:
+            remaining = set(zs)
+            for h in order:
+                u = {k: sum(coef[f] * zs[k][f] for f in features) for k in remaining}
+                m = max(u.values())
+                ex = {k: math.exp(u[k] - m) for k in remaining}
+                s = sum(ex.values())
+                for f in features:
+                    grad[f] += zs[h][f] - sum(ex[k] * zs[k][f] for k in remaining) / s
+                remaining.discard(h)
+        for f in features:
+            coef[f] += lr * grad[f] / len(data)
+    params["coef"] = coef
+    return params
+
+
+def loglik(races, params, top=3):
+    """1〜top着の並びの平均対数尤度（大きいほど良い）"""
+    total = 0.0
+    for r in races:
+        p = probs(r["feats"], params)
+        remaining = dict(p)
+        for h in r["order"][:top]:
+            if h not in remaining:
+                break
+            s = sum(remaining.values())
+            total += math.log(max(remaining[h] / s, 1e-9))
+            del remaining[h]
+    return total / len(races)
