@@ -11,6 +11,11 @@ from .features import FEATURES
 
 PARAMS_FILE = Path(__file__).resolve().parent.parent / "params.json"
 
+# 向きが決まっている要素は、プラスの方向にしか効かせない（少ないデータで逆向きの重みが付くのを防ぐ）。
+# 例: 騎手の成績が良いほど勝率が下がる、のような不自然な学習結果は採用しない。
+POSITIVE_ONLY = {"speed_best", "speed_avg", "level", "course_fit", "going_fit", "jockey", "trainer",
+                 "jockey_trainer", "jockey_course", "sire", "damsire", "track_fit", "experience", "market"}
+
 
 def load_params():
     if PARAMS_FILE.exists():
@@ -75,6 +80,8 @@ def fit(races, features=None, l2=0.02, iters=400, lr=0.3, top=3):
                 remaining.discard(h)
         for f in features:
             coef[f] += lr * grad[f] / len(data)
+            if f in POSITIVE_ONLY:
+                coef[f] = max(coef[f], 0.0)
     params["coef"] = coef
     return params
 
