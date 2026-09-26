@@ -71,6 +71,37 @@ def auto_select(p, n_others=6):
     return axis, rest[:2], rest[2:2 + n_others]
 
 
+def select(p, market, strategy="確率順"):
+    """48点のまま、軸・対抗・相手の選び方を変える。
+    確率順   : 軸=2着内率1位、対抗=3着内率の次の2頭、相手=その次の6頭
+    軸2番手  : 軸=2着内率2位（人気が集中する1位を外して配当を狙う）
+    妙味相手 : 軸・対抗は確率順、相手は「モデルの3着内率÷人気から見た3着内率」が高い6頭
+    妙味軸   : 2着内率上位4頭のうち、人気に対してモデル評価が最も高い馬を軸に"""
+    pp = place_probs(p)
+    mk = place_probs(market) if market else pp
+    by_top2 = sorted(pp, key=lambda k: -pp[k][1])
+    by_top3 = lambda ex: [k for k in sorted(pp, key=lambda k: -pp[k][2]) if k not in ex]  # noqa: E731
+    value = lambda k: pp[k][2] / max(mk[k][2], 1e-6)  # noqa: E731
+    if strategy == "軸2番手":
+        axis = by_top2[1]
+    elif strategy == "妙味軸":
+        axis = max(by_top2[:4], key=lambda k: pp[k][1] / max(mk[k][1], 1e-6))
+    else:
+        axis = by_top2[0]
+    rest = by_top3({axis})
+    rivals = rest[:2]
+    if strategy == "妙味相手":
+        pool = [k for k in rest[2:] if pp[k][2] >= 0.05]
+        others = sorted(pool, key=lambda k: -value(k))[:6]
+        others += [k for k in rest[2:] if k not in others][:6 - len(others)]
+    else:
+        others = rest[2:8]
+    return axis, rivals, others
+
+
+STRATEGIES = ["確率順", "軸2番手", "妙味相手", "妙味軸"]
+
+
 def search_best(p, tri_odds, n_others=6, top=5, pool=10):
     """期待回収率が高い 軸・対抗・相手 の組み合わせを探す（上位 pool 頭から）。"""
     pp = place_probs(p)

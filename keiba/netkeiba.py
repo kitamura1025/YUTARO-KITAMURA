@@ -20,10 +20,18 @@ DB = "https://db.netkeiba.com"
 WAIT = 0.7
 
 
-def fetch(url, refresh=False, max_age_days=None, wait=None):
+class NotCached(Exception):
+    pass
+
+
+def fetch(url, refresh=False, max_age_days=None, wait=None, cached_only=False):
     CACHE.mkdir(parents=True, exist_ok=True)
     key = re.sub(r"[^A-Za-z0-9]+", "_", url.split("://", 1)[1])[:200]
     path = CACHE / key
+    if cached_only:
+        if not path.exists():
+            raise NotCached(url)
+        return path.read_text(encoding="utf-8")
     fresh = path.exists() and not refresh and (
         max_age_days is None or time.time() - path.stat().st_mtime < max_age_days * 86400)
     if fresh:
@@ -86,6 +94,8 @@ class Entry:
     popularity: int | None = None
     training: str | None = None  # A/B/C/D
     training_note: str = ""
+    jockey_id: str = ""
+    trainer_id: str = ""
 
 
 def _parse_past_cell(td):
@@ -149,11 +159,14 @@ def race_card(race_id, refresh=False):
         jk = re.search(r'class="Jockey">.*?<a[^>]*>(.*?)</a>.*?<span>([\d.]+)</span>', row, re.S)
         past = [p for p in (_parse_past_cell(td) for td in re.findall(r'<td class="Past.*?</td>', row, re.S)) if p]
         hid = re.search(r'db\.netkeiba\.com/horse/(\w+)', info_td)
+        jid = re.search(r'class="Jockey">.*?/jockey/(?:result/recent/)?(\w+)', row, re.S)
+        tid = re.search(r'/trainer/(?:result/recent/)?(\w+)', info_td)
         entries.append(Entry(
             horse_id=hid.group(1) if hid else "", waku=int(_text(tds[0][1])), umaban=int(_text(tds[1][1])), name=name,
             sex=barei[0], age=int(re.search(r"\d+", barei).group(0)),
             jockey=_text(jk.group(1)) if jk else "", weight=float(jk.group(2)) if jk else 0.0,
             trainer=trainer, style=style.group(1) if style else "", past=past,
+            jockey_id=jid.group(1) if jid else "", trainer_id=tid.group(1) if tid else "",
         ))
     return info, entries
 
@@ -263,12 +276,13 @@ class Run:
     distance: int
     going: str
     time: float | None
-    diff: float | None
+    diff: float | None  # 勝ち馬との差（勝った場合は2着との差をマイナスで）
     passage: list
     pace: tuple | None  # (前半3F, 後半3F) レース全体
     last3f: float | None
     body_weight: int | None
     other_id: str  # 勝ち馬（自分が1着なら2着馬）のID
+    jockey_id: str = ""
 
     @property
     def jra(self):
@@ -309,13 +323,71 @@ def horse_history(horse_id, max_age_days=3):
             pace=(float(pace.group(1)), float(pace.group(2))) if pace else None,
             last3f=_num(g(27)), body_weight=int(bw.group(1)) if bw else None,
             other_id=other.group(1) if other else "",
+            jockey_id=(re.search(r"/jockey/(?:result/recent/)?(\w+)", tds[12]) or [None, ""])[1],
         ))
     return runs
 
 
-def race_members(race_id):
+def _uncache(url):
+    (CACHE / re.sub(r"[^A-Za-z0-9]+", "_", url.split("://", 1)[1])[:200]).unlink(missing_ok=True)
+
+
+def race_members_live(race_id):
+    """当日・前日のレース（db.netkeiba にまだ載っていない）を速報の結果ページから。
+    通過順は「コーナー通過順位」の最初のコーナーから作る。"""
+    url = f"{RACE}/race/result.html?race_id={race_id}"
+    t = fetch(url)
+    rows = re.findall(r'<tr\s+class="(?:FirstDisplay )?HorseList"[^>]*>\s*<td class="Result_Num">.*?</tr>', t, re.S)
+    if not rows:
+        _uncache(url)  # まだ結果が出ていない
+        return {"race_id": race_id, "surface": "", "distance": 0, "going": "", "place": "", "field_size": 0}, []
+    rd = _text(re.search(r'RaceData01">(.*?)</div>', t, re.S).group(1))
+    sd = re.search(r"(芝|ダ|障)(\d+)m", rd)
+    gm = re.search(r"馬場:(良|稍|重|不)", rd)
+    corner = {}
+    ct = re.search(r'Corner_Num">(.*?)</table>', t, re.S)
+    if ct:
+        for cell in re.findall(r"<td>(.*?)</td>", ct.group(1), re.S):
+            seq = [int(x) for x in re.findall(r"\d+", _text(cell))]
+            if seq:
+                corner = {num: i + 1 for i, num in enumerate(seq)}
+                break
+    runners = []
+    for row in rows:
+        rk = _text(re.search(r'class="Rank">(.*?)<', row).group(1))
+        nums = re.findall(r'<td class="Num[^"]*">\s*<div>(\d+)</div>', row)
+        hid = re.search(r"/horse/(\w+)", row)
+        tm = re.search(r'RaceTime">(.*?)<', row)
+        od = re.search(r'<td class="Odds Txt_R">\s*<span[^>]*>([\d.]+)</span>', row)
+        um = int(nums[1]) if len(nums) > 1 else None
+        runners.append({"rank": int(rk) if rk.isdigit() else None, "waku": int(nums[0]) if nums else None,
+                        "umaban": um, "horse_id": hid.group(1) if hid else "", "name": "",
+                        "time": _time_sec(tm.group(1)) if tm else None,
+                        "passage": [corner[um]] if um in corner else [], "odds": _num(od.group(1)) if od else None})
+    info = {"race_id": race_id, "surface": sd.group(1) if sd else "", "distance": int(sd.group(2)) if sd else 0,
+            "going": gm.group(1) if gm else "", "field_size": len(runners),
+            "place": next((k for k, v in PLACES.items() if race_id[4:6] == v), "")}
+    return info, runners
+
+
+def race_list(yyyymmdd, refresh=False):
+    """その日の全レース {race_id: (芝/ダ/障, 距離)}"""
+    t = fetch(f"{RACE}/top/race_list_sub.html?kaisai_date={yyyymmdd}", refresh=refresh)
+    out = {}
+    for it in re.findall(r'<li class="RaceList_DataItem.*?</li>', t, re.S):
+        rid = re.search(r"race_id=(\d{12})", it)
+        sd = re.search(r"(芝|ダ|障)(\d+)m", _text(it))
+        if rid and sd:
+            out[rid.group(1)] = (sd.group(1), int(sd.group(2)))
+    return out
+
+
+def race_members(race_id, cached_only=False):
     """確定済みレースの全出走馬。db.netkeiba のレースページから。"""
-    t = fetch(f"{DB}/race/{race_id}/")
+    url = f"{DB}/race/{race_id}/"
+    t = fetch(url, cached_only=cached_only)
+    if "race_table_01" not in t:  # まだ行われていないレースはキャッシュしない
+        _uncache(url)
     head = _text((re.search(r'racedata fc">(.*?)</dl>', t, re.S) or re.search(r"racedata.*?</p>", t, re.S)).group(0))
     sd = re.search(r"(芝|ダ|障)[右左直外内 ]*(\d+)m", head)
     gm = re.search(r"(?:芝|ダート) : (良|稍重|重|不良)", head)
@@ -342,6 +414,27 @@ def race_members(race_id):
             "weight": _num(g(5)), "jockey": g(6), "time": _time_sec(g(7)),
             "passage": [int(x) for x in re.findall(r"\d+", g(14))], "last3f": _num(g(15)),
             "odds": _num(g(16)), "popularity": _num(g(17), int),
+            "jockey_id": (re.search(r"/jockey/(?:result/recent/)?(\w+)", tds[6]) or [None, ""])[1],
+            "trainer_id": (re.search(r"/trainer/(?:result/recent/)?(\w+)", tds[22]) or [None, ""])[1],
         })
     info["field_size"] = len(runners)
     return info, runners
+
+
+def pedigree(horse_id, cached_only=False):
+    """父・母・母父。{'sire_id','sire','dam','damsire_id','damsire'}"""
+    t = fetch(f"{DB}/horse/ped/{horse_id}/", cached_only=cached_only)
+    m = re.search(r"<table[^>]*blood_table[^>]*>.*?</table>", t, re.S)
+    out = {"sire_id": "", "sire": "", "dam": "", "damsire_id": "", "damsire": ""}
+    if not m:
+        return out
+    tops = re.findall(r'rowspan="16"[^>]*>.*?/horse/(\w+)/"[^>]*>(.*?)</a>', m.group(0), re.S)
+    if tops:
+        out["sire_id"], out["sire"] = tops[0][0], _text(tops[0][1])
+    if len(tops) > 1:
+        out["dam"] = _text(tops[1][1])
+        dam_row = m.group(0).split(tops[1][0], 1)[1]
+        ds = re.search(r'rowspan="8"[^>]*>.*?/horse/(\w+)/"[^>]*>(.*?)</a>', dam_row, re.S)
+        if ds:
+            out["damsire_id"], out["damsire"] = ds.group(1), _text(ds.group(2))
+    return out

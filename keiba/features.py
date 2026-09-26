@@ -33,8 +33,18 @@ FEATURES = [
     "age",           # 年齢
     "inner",         # 内枠(1〜4枠)
     "experience",    # 同じ芝ダ・距離帯の出走数 log(1+n)
+    "jockey",        # 騎手（人気以上に3着内に来ているか。直近2年）
+    "trainer",       # 調教師（同上。直近3年）
+    "jockey_trainer",  # 騎手×調教師の相性
+    "jockey_course", # 騎手×競馬場（芝ダ別）
+    "sire",          # 父の産駒が 同じ芝ダ・距離帯・馬場 で人気以上に走っているか
+    "damsire",       # 母父（同上）
+    "track_fit",     # 開催中の馬場傾向（前有利/内有利）と脚質・枠の相性
     "market",        # 単勝オッズから見た勝率の対数
 ]
+
+# 馬自身の適性（コース・馬場）の回数ルール: 引き戻しの強さと最低回数
+APT_K, APT_MIN_N = 3.0, 2
 
 
 def parse_date(s):
@@ -149,8 +159,10 @@ def pace_forecast(early_by_horse):
 
 # ---- まとめ ----
 
-def horse_features(entry, target, before, pace_idx, market_p=None):
-    """entry: netkeiba.Entry か同じ属性を持つもの / target: 今回の条件 / before: 今回の日付"""
+def horse_features(entry, target, before, pace_idx, market_p=None, bias=None):
+    """entry: netkeiba.Entry か同じ属性を持つもの / target: 今回の条件 / before: 今回の日付
+    bias: stats.meet_bias の結果（開催中の傾向）"""
+    from . import stats
     runs = [r for r in history(entry.horse_id) if parse_date(r.date) < before and r.surface in ("芝", "ダ")]
     f = dict.fromkeys(FEATURES)
     detail = []
@@ -183,10 +195,11 @@ def horse_features(entry, target, before, pace_idx, market_p=None):
             lvl.append((RECENCY[i], lv - max(r.diff, 0.0) / (r.distance / 1000)))
     mean_all = sum(allv) / len(allv) if allv else None
 
-    def shrunk(vals, k=2.0):
-        if not vals or mean_all is None:
+    def shrunk(vals):
+        """回数が少ないほど 0 に引き戻す。最低回数未満は使わない"""
+        if len(vals) < APT_MIN_N or mean_all is None:
             return None
-        return (sum(vals) / len(vals) - mean_all) * len(vals) / (len(vals) + k)
+        return (sum(vals) / len(vals) - mean_all) * len(vals) / (len(vals) + APT_K)
 
     f["speed_avg"] = vsum / wsum if wsum else None
     f["speed_best"] = best
@@ -203,4 +216,9 @@ def horse_features(entry, target, before, pace_idx, market_p=None):
     f["inner"] = 1.0 if entry.waku <= 4 else 0.0
     f["experience"] = math.log1p(exp_n)
     f["market"] = math.log(market_p) if market_p else None
-    return f, {"runs": detail, "early": e, "course_n": len(course_v), "going_n": len(going_v)}
+    conn, ped = stats.connections(entry, target, before)
+    for k, st in conn.items():
+        f[k] = st.value
+    f["track_fit"] = stats.track_fit(bias, e, entry.waku) if bias else None
+    return f, {"runs": detail, "early": e, "course_n": len(course_v), "going_n": len(going_v),
+               "conn": conn, "ped": ped}

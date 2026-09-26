@@ -13,7 +13,7 @@ import pickle
 from pathlib import Path
 from types import SimpleNamespace
 
-from keiba import betting, features, model, netkeiba
+from keiba import betting, features, model, netkeiba, stats
 
 DATA = Path(__file__).resolve().parent / "data"
 RACES_FILE = DATA / "backtest_races.json"
@@ -58,7 +58,8 @@ def build_race(rid):
     early = {k: features.early_position([r for r in features.history(e.horse_id)
                                          if features.parse_date(r.date) < before]) for k, e in entries.items()}
     pace_idx, _ = features.pace_forecast(early)
-    feats = {k: features.horse_features(e, info, before, pace_idx, (1 / e.odds) / total)[0]
+    bias = stats.meet_bias(rid, info["surface"], info["going"], before)
+    feats = {k: features.horse_features(e, info, before, pace_idx, (1 / e.odds) / total, bias)[0]
              for k, e in entries.items()}
     order = [m["umaban"] for m in sorted(members, key=lambda m: m["rank"] or 99) if m["rank"]]
     return {"id": rid, "date": info["date"], "name": info["name"], "feats": feats, "order": order}
@@ -89,6 +90,7 @@ def load_dataset(ids, rebuild=False):
         prefetch(ids)
     features.standards.cache_clear()
     features.history.cache_clear()
+    stats.table.cache_clear()
     out = []
     for i, rid in enumerate(ids):
         if rid not in cached:
@@ -106,18 +108,20 @@ def load_dataset(ids, rebuild=False):
 
 
 def simulate(races, params, label):
-    """毎レース、モデルの自動選択で北村式48点を買った場合"""
-    hits = paid = cost = 0
-    for r in races:
-        p = model.probs(r["feats"], params)
-        axis, rivals, others = betting.auto_select(p)
-        tickets = set(betting.formation(axis, rivals, others))
-        cost += len(tickets) * 100
-        if tuple(r["order"][:3]) in tickets:
-            hits += 1
-            tri = netkeiba.result(r["id"])["trifecta"]
-            paid += tri[1] if tri else 0
-    print(f"  {label:<12} 的中 {hits}/{len(races)} ({hits / len(races):.0%})  回収率 {paid / cost:.0%}")
+    """毎レース北村式48点を買った場合の成績を、軸・対抗・相手の選び方ごとに出す"""
+    import math
+    for strategy in betting.STRATEGIES:
+        hits = paid = cost = 0
+        for r in races:
+            p = model.probs(r["feats"], params)
+            mk = {k: math.exp(v["market"]) for k, v in r["feats"].items() if v.get("market") is not None}
+            tickets = set(betting.formation(*betting.select(p, mk, strategy)))
+            cost += len(tickets) * 100
+            if tuple(r["order"][:3]) in tickets:
+                hits += 1
+                tri = netkeiba.result(r["id"])["trifecta"]
+                paid += tri[1] if tri else 0
+        print(f"  {label:<10} {strategy:<6} 的中 {hits:>2}/{len(races)} ({hits / len(races):.0%})  回収率 {paid / cost:.0%}")
 
 
 def main():
