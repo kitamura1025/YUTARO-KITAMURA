@@ -91,6 +91,17 @@ def standards():
         if base and going in GOING_GROUP:
             offs.setdefault((surf, going), []).append((t - base) / (dist / 1000))
     going_off = {k: statistics.median(v) for k, v in offs.items() if len(v) >= 5}
+    snap_path = netkeiba.CACHE.parent / "snapshot.json"
+    if snap_path.exists() and not OFFLINE:
+        # 新しい環境などでキャッシュが少ないときは、保存済みの基準タイムを使う
+        import json
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        if len(snap["standards"]) > len(std):
+            std = {}
+            for k, v in snap["standards"].items():
+                place, surf, dist = k.split("|")
+                std[(place, surf, int(dist))] = v
+            going_off = {tuple(k.split("|")): v for k, v in snap["going_off"].items()}
     return std, going_off
 
 

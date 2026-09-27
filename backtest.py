@@ -190,6 +190,10 @@ def main():
         print(f"  {f:<12} {c:+.3f}")
     model.save_params(final)
     print("params.json に保存しました")
+    features.OFFLINE = False
+    stats.table.cache_clear()
+    features.standards.cache_clear()
+    print(f"data/snapshot.json を更新しました（{stats.save_snapshot() / 1e6:.1f}MB）")
 
 
 if __name__ == "__main__":

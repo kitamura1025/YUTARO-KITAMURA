@@ -67,6 +67,12 @@ JRAのレース予想と、北村さん独自の3連単フォーメーション�
 - `python3 backtest.py --collect 300` で検証レースを集め直す（初回は1時間程度かかる）
 - 学習結果の重みと検証成績は、変えたら README.md の「現在のモデル」に書く
 
+## 集めたデータの要約（data/snapshot.json）
+
+- `data/cache/` は git 管理外なので、新しい環境では空になる
+- 基準タイムと騎手・調教師・血統の集計は `data/snapshot.json`（git管理）に要約して保存してあり、
+  キャッシュが少ないときは自動でこちらを使う。`backtest.py` を実行すると最後に更新される
+
 ## データの取り方
 
 - netkeiba（race.netkeiba.com / db.netkeiba.com）の公開ページのみ使う。**ログインはしない・パスワードは受け取らない**

@@ -100,7 +100,7 @@ class RunTable:
             resid = (rank <= 3) - self.expect[self._bucket(odds)]
             for kind, key in keys:
                 if all(key if isinstance(key, tuple) else [key]):
-                    self.index[(kind, key)].append((d, resid))
+                    self.index[(kind, key)].append((d, resid, 1))
         for v in self.index.values():
             v.sort()
         self.n_rows = len(rides)
@@ -116,17 +116,63 @@ class RunTable:
         lst = self.index.get((kind, key), [])
         lo = bisect.bisect_left(lst, (before - timedelta(days=window),)) if window else 0
         hi = bisect.bisect_left(lst, (before,))
-        vals = [x for _, x in lst[lo:hi]]
-        n = len(vals)
+        n = sum(c for _, _, c in lst[lo:hi])
         if n == 0:
             return Stat(None, 0, None)
-        s = sum(vals)
+        s = sum(x for _, x, _ in lst[lo:hi])
         return Stat(s / (n + k) if n >= min_n else None, n, s / n)
+
+    # ---- スナップショット（集めたデータの要約をリポジトリに保存して、新しい環境でも使う） ----
+
+    def to_snapshot(self):
+        """キーごとに月単位で (回数, 上振れの合計) にまとめる"""
+        out = {}
+        for (kind, key), lst in self.index.items():
+            months = defaultdict(lambda: [0, 0.0])
+            for d, x, c in lst:
+                m = months[d.strftime("%Y-%m-01")]
+                m[0] += c
+                m[1] += x
+            k = kind + "|" + ("|".join(key) if isinstance(key, tuple) else key)
+            out[k] = [[m, n, round(sx, 3)] for m, (n, sx) in sorted(months.items())]
+        return {"n_rows": self.n_rows, "index": out}
+
+    @classmethod
+    def from_snapshot(cls, snap):
+        self = cls.__new__(cls)
+        self.index = defaultdict(list)
+        for k, rows in snap["index"].items():
+            kind, *key = k.split("|")
+            key = tuple(key) if len(key) > 1 else key[0]
+            self.index[(kind, key)] = [(parse_date(m.replace("-", "/")), sx, n) for m, n, sx in rows]
+        self.n_rows, self.n_races, self.expect = snap["n_rows"], 0, {}
+        return self
+
+
+SNAPSHOT = netkeiba.CACHE.parent / "snapshot.json"
 
 
 @lru_cache(maxsize=1)
 def table():
-    return RunTable()
+    """キャッシュから作った集計と、保存済みスナップショットのうち、データが多い方を使う"""
+    live = RunTable()
+    if SNAPSHOT.exists() and not features.OFFLINE:
+        import json
+        snap = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+        if snap["stats"]["n_rows"] > live.n_rows:
+            return RunTable.from_snapshot(snap["stats"])
+    return live
+
+
+def save_snapshot():
+    """基準タイムと騎手・調教師・血統の集計を data/snapshot.json に保存（git管理）"""
+    import json
+    std, going_off = features.standards()
+    snap = {"standards": {"|".join(map(str, k)): round(v, 2) for k, v in std.items()},
+            "going_off": {"|".join(k): round(v, 3) for k, v in going_off.items()},
+            "stats": table().to_snapshot()}
+    SNAPSHOT.write_text(json.dumps(snap, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return SNAPSHOT.stat().st_size
 
 
 def connections(entry, target, before):
