@@ -33,7 +33,8 @@ def fmt(x, nd=2, sign=True):
 
 
 def opponents_note(run, before, limit=4):
-    """その走で負かした相手・負けた相手の、その後の成績（上位の着順の馬のみ）"""
+    """その走で負かした相手・負けた相手について、
+    ①その時のタイム差 ②その後の成績 ③その後のベストのスピード指数 を出す"""
     try:
         _, members = netkeiba.race_members(run.race_id)
     except Exception:  # noqa: BLE001
@@ -48,9 +49,16 @@ def opponents_note(run, before, limit=4):
             continue
         good = [r for r in after if r.rank and r.rank <= 3]
         best = min(after, key=lambda r: (r.rank or 99))
+        figs = [f for f in (features.speed_figure(r) for r in after if r.surface == run.surface) if f is not None]
+        if run.time and m["time"]:
+            gap = run.time - m["time"]
+            margin = f"{abs(gap):.1f}秒差で{'負け' if gap > 0 else '先着' if gap < 0 else '同タイム'}"
+        else:
+            margin = "タイム差不明"
         rel = "負けた" if (run.rank or 99) > m["rank"] else "負かした"
-        notes.append(f"{rel}{m['name']}({m['rank']}着)→その後{len(after)}戦{len(good)}回3着内"
-                     f"（最高: {best.name[:12]} {best.rank}着）")
+        notes.append(f"{rel}{m['name']}({m['rank']}着・{margin})→その後{len(after)}戦{len(good)}回3着内"
+                     f"（最高: {best.name[:12]} {best.rank}着"
+                     + (f" / その後のベスト指数 {max(figs):+.2f}" if figs else "") + "）")
         if len(notes) >= limit:
             break
     return notes
