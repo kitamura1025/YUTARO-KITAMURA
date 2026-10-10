@@ -8,6 +8,7 @@
 - 展開         : 各馬の位置取り傾向から今回のペースを予想し、脚質との相性を出す
 """
 import math
+import sys
 import statistics
 from datetime import date
 from functools import lru_cache
@@ -66,7 +67,14 @@ def history(horse_id, max_age_days=3):
         except netkeiba.NotCached:
             return ()
         max_age_days = None
-    return tuple(netkeiba.horse_history(horse_id, max_age_days=max_age_days))
+    try:
+        return tuple(netkeiba.horse_history(horse_id, max_age_days=max_age_days))
+    except Exception as ex:  # noqa: BLE001  1頭の取得失敗で予想全体を止めない
+        print(f"成績を取得できません: {horse_id} ({ex})", file=sys.stderr)
+        try:
+            return tuple(netkeiba.horse_history(horse_id, max_age_days=None))  # 手元のデータがあれば使う
+        except Exception:  # noqa: BLE001
+            return ()
 
 
 # ---- 基準タイム ----
