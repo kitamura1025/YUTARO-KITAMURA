@@ -59,8 +59,14 @@ def main():
         path = Path(f"predictions/{rid}.md")
         old_line, old_hit = model_pick(path.read_text(encoding="utf-8")) if path.exists() else (None, None)
         going, alerts = going_of(rid)
-        subprocess.run([sys.executable, "predict.py", rid, "--going", going, "--quick"],
-                       capture_output=True, text=True, timeout=1200)
+        for attempt in range(2):  # 取得の一時的な失敗に備えて1回だけやり直す
+            res = subprocess.run([sys.executable, "predict.py", rid, "--going", going, "--quick"],
+                                 capture_output=True, text=True, timeout=1200)
+            if res.returncode == 0:
+                break
+        if res.returncode != 0:
+            print(f"### {rid} 更新に失敗（前回の予想のまま）: {res.stderr.strip().splitlines()[-1:]}\n", flush=True)
+            continue
         md = path.read_text(encoding="utf-8")
         line, hit = model_pick(md)
         title = md.splitlines()[0][2:]
