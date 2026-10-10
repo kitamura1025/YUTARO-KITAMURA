@@ -7,6 +7,7 @@ import html
 import json
 import re
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,8 +38,15 @@ def fetch(url, refresh=False, max_age_days=None, wait=None, cached_only=False):
     if fresh:
         return path.read_text(encoding="utf-8")
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        raw = r.read()
+    for attempt in range(5):  # サイト側が一時的に 400/429/5xx を返すことがあるので、間隔を空けてやり直す
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+            break
+        except urllib.error.HTTPError as ex:
+            if attempt == 4 or ex.code not in (400, 429, 500, 502, 503, 504):
+                raise
+            time.sleep(3 * 2 ** attempt)
     enc = "euc-jp" if b"EUC-JP" in raw[:2000].upper() else "utf-8"
     body = raw.decode(enc, errors="ignore")
     path.write_text(body, encoding="utf-8")
