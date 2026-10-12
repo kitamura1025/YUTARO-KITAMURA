@@ -63,7 +63,10 @@
     6,
     3,
     1
-   ]
+   ],
+   "hit": false,
+   "return": 0,
+   "cost": 4800
   },
   "model": {
    "axis": 5,
@@ -78,9 +81,20 @@
     6,
     3,
     1
-   ]
+   ],
+   "hit": false,
+   "return": 0,
+   "cost": 4800
   },
   "memo": "10/12 京都10Rのみ購入（A/B/C全て買い）",
-  "result": null
+  "result": {
+   "top3": [
+    5,
+    2,
+    9
+   ],
+   "payout": 1210,
+   "going": "良"
+  }
  }
 ]
