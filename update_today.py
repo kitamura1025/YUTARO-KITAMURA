@@ -80,6 +80,12 @@ def main():
             changes.append(f"買い目が変更（前: {old_line}）")
         print(f"### {rid[4:6]=='05' and '東京' or '京都'}{int(rid[-2:])}R {title}（馬場 {going} / オッズ {updated.group(1) if updated else '-'}）")
         print(f"- 判定: **{verdict}**（的中確率 {hit}%）" + ("" if old_hit is None else f" ← 前回 {old_hit}%"))
+        ev = re.search(r"期待回収率 (\d+)%", md.split("## モデル自動選択", 1)[1])
+        ev = int(ev.group(1)) / 100 if ev else None
+        print(f"- 期待値 {ev if ev is not None else '-'}（Σ 的中率×オッズ ÷ 点数。1.0超でプラス）"
+              f" / A(15%以上) {'買い' if hit and hit >= BUY_LINE else '見送り'}"
+              f" / B(25%以上) {'買い' if hit and hit >= 25 else '見送り'}"
+              f" / C(期待値1.0以上) {'買い' if ev and ev >= 1.0 else '見送り'}")
         print(f"- {line}")
         print("- 変更: " + (" / ".join(changes) if changes else "なし"))
         if alerts:
